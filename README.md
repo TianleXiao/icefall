@@ -51,6 +51,23 @@ RFC 8446 里 `Transcript-Hash(ClientHello)` 参与 key schedule 派生。
 
 卸载：双击 `uninstall.bat`。
 
+### Windows TUN 模式（给不读系统代理的程序）
+
+微信客户端内的视频号、游戏启动器、云游戏这类程序完全无视系统代理，只有 TUN 能救。
+
+1. 双击 **`activate-tun.bat`**（会自己弹 UAC 提权）
+2. 它会自动找 `wintun.dll`（WireGuard / Tailscale / 迅游装过就有，没有就手动复制一份进来）
+3. 建一块叫 `Icefall` 的虚拟网卡，加 `0.0.0.0/1` 与 `128.0.0.0/1` 两条路由，接管全部 IPv4
+4. 本机代理仍在 `127.0.0.1:8899`，PAC 会被自动清掉（TUN 已经全接管，不需要 PAC）
+
+停止：关掉 Icefall 窗口会自己撤路由。**如果进程被强杀导致路由残留、整机断网，双击 `stop-tun.bat` 清理。**
+
+TUN 模式的设计取舍：
+
+- 用户态自己写了一层 TCP/IP 栈（`packet.go` / `tunstack.go` / `tunmode.go`），不依赖 gVisor —— gVisor 那个快照在 Go 1.27 上编译不过。
+- 只有在收到第一段应用数据、解析出 ClientHello 的 SNI 之后才决定后端走分片还是上游，所以握手之外的分流判定和代理模式完全一致。
+- 程序自身出站用 `IP_UNICAST_IF` 钉在物理网卡上，否则自己的包又会被 TUN 吃回去，递归到死。
+
 ### macOS
 
 1. 下载 `Icefall-mac.tar.gz`，解压
@@ -82,13 +99,15 @@ RFC 8446 里 `Transcript-Hash(ClientHello)` 参与 key schedule 派生。
 | 浏览器 | 全自动（读系统代理 / PAC） |
 | 走系统代理的程序 | 自动 |
 | 支持 SOCKS5 的程序 | 手动填 `127.0.0.1:8899`，同一个端口，协议自动识别，判定逻辑与浏览器完全一致（含自动学习） |
-| 完全不读代理的程序 | 微信客户端、部分游戏启动器：**需要 TUN，尚未实现** |
-| UDP 流量 | 未实现（走 Clash TUN） |
+| 完全不读代理的程序 | 用 TUN 模式（`activate-tun.bat`）后自动覆盖：微信客户端、游戏启动器、云游戏 |
+| UDP 流量 | TUN 模式下按目的地址直连转发（QUIC / 游戏 UDP 都能过）；代理模式下不支持 |
 
 ## 命令行
 
 ```bash
 icefall proxy [addr] [upstream]   # 启动代理，默认 127.0.0.1:8899
+icefall tun [addr] [upstream]     # TUN 模式，整机接管（需管理员）
+icefall tunclean                  # 清理 TUN 残留路由
 icefall discover                  # 探测本机网络，生成 strategy.json
 icefall check                     # 经代理逐个验证站点
 icefall pac                       # 打印生成的 PAC
@@ -172,8 +191,9 @@ GOOS=darwin GOARCH=amd64 go build -o icefall-darwin-amd64 .
 
 ## 已知边界
 
-- **TUN 未实现**。gVisor 的 `pkg/tcpip/stack` 在 Go 1.27 下编译失败（`found packages stack and bridge`，来自 `bridge_test.go` 声明 `package bridge_test`；且 `pkg/sync` 的 codegen 只覆盖到 go1.26），Windows 建 TUN 网卡还要管理员权限。代码在 `_tun_wip/`，架构已画好，缺一个能编译的用户态栈。
-- **UDP 未实现**。海马云电脑、部分游戏的串流走 UDP/WebRTC，HTTP 代理和 SOCKS5 TCP 都碰不到。
+- **TUN 只在 Windows 上可用**，且需要管理员权限。macOS 侧要整机接管得走 NetworkExtension（需 Apple Developer 会员，源码骨架在 `mac/NetworkExtension/`）。
+- **TUN 的用户态栈是精简实现**：正常握手/收发/重传/窗口都有，但没做拥塞控制、SACK、窗口缩放、路径 MTU 发现。跑满千兆不现实，日常看视频够用。
+- **UDP 在代理模式下不支持**（SOCKS5 UDP ASSOCIATE 未实现，会明确回 `0x07`）。TUN 模式下 UDP 按目的地址直连转发，能过 QUIC 和游戏 UDP，但不做分片改写（UDP 没有 TLS 握手，本来也不需要）。
 - **微信视频号在客户端内不通**。微信不读系统代理，`short/long.weixin.qq.com` 且是「学校 RST + 腾讯只认白名单 SNI」双重限制，分片救不了，只能上游。
 - **境外站靠上游，不靠分片**。`google.com` / `youtube.com` 是 DNS 污染 + IP 层封锁，分片救不了（实测 `www.google.com` 被解析到 Twitter 的 IP，真实 IP 的 443 也不通）。未收录时会自动判到 upstream 并记住，前提是配了兜底上游（Clash）；没配就只剩直连。
 
@@ -181,6 +201,10 @@ GOOS=darwin GOARCH=amd64 go build -o icefall-darwin-amd64 .
 
 ```
 *.go              代理核心：proxy / snipatch / cuts / cutcache / strategy / pac / socks / discover
+packet.go         TUN 用：IPv4/TCP/UDP 解析与构造、校验和
+tunstack.go       TUN 用：自带用户态 TCP 栈（握手/重传/窗口/UDP 转发）
+tunmode.go        TUN 用：按 SNI 选后端，把栈接到策略表
+tun_windows.go    TUN 用：wintun 建卡、netsh 配网、路由接管与清理
 sysproxy_*.go     平台层：系统代理、开机自启
 mac/              macOS 包脚本、Info.plist、app launcher
 _tun_wip/         TUN 模式半成品（未编译通过）

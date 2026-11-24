@@ -57,7 +57,7 @@ func NewProxy(addr string) *Proxy {
 	return &Proxy{
 		Addr:   addr,
 		rules:  map[string]Rule{},
-		dialer: &net.Dialer{Timeout: 10 * time.Second},
+		dialer: newDialer(10 * time.Second),
 		cuts:   newCutCache(),
 		memo:   map[string]Mode{},
 	}
@@ -658,6 +658,6 @@ func atoiPort(s string) int {
 // dialShort 用更短的超时拨号：未收录域名探测时不能沿用 10s，
 // 否则一个坏 IP 就把整条连接拖到客户端超时。
 func (p *Proxy) dialShort(addr string, d time.Duration) (net.Conn, error) {
-	dd := &net.Dialer{Timeout: d}
+	dd := newDialer(d)
 	return dd.Dial("tcp", addr)
 }

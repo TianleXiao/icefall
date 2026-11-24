@@ -45,6 +45,11 @@ func main() {
 	switch mode {
 	case "proxy":
 		runProxy()
+	case "tun":
+		// 整机接管：给不读系统代理的程序（微信客户端、游戏、云游戏）用
+		runTun()
+	case "tunclean":
+		cleanTun()
 	case "filecut":
 		fileCutTest(os.Args[2], os.Args[3])
 	case "cut":
@@ -154,6 +159,8 @@ func printUsage() {
   discover                 探测本机网络封锁情况，生成 strategy.json
   check [domain...]        经本地代理逐个验证站点是否可打开
   pac                      打印生成的 PAC
+  tun [addr] [upstream]    整机接管（TUN 模式，需管理员）：让不读系统代理的程序也生效
+  tunclean                 清理 TUN 残留路由（进程被强杀后用）
   setproxy [addr|pac]      设置系统代理（pac 表示走 PAC 自动分流）
   unsetproxy               还原系统代理
   autostart [args...]      写开机自启
@@ -192,22 +199,7 @@ func runProxy() {
 		addr = os.Args[2]
 	}
 
-	p := NewProxy(addr)
-	// 上游代理可选：显式传了就转给它，不传就直连。
-	// 别人机器上没装 Clash，硬编码默认值会让他所有非分片流量打到空端口上。
-	if len(os.Args) > 3 {
-		p.Upstream = os.Args[3]
-		logf("兜底上游: %s（不在分片名单的流量走这里）", p.Upstream)
-	} else {
-		logf("兜底上游: 无（不在分片名单的流量直连）")
-	}
-
-	// 策略表：内置实测结果 + strategy.json 覆盖
-	strat := builtinStrategy()
-	if err := strat.Load(filepath.Join(exeDir(), "strategy.json")); err == nil {
-		logf("已加载 strategy.json")
-	}
-	p.Strategy = strat
+	p := setupProxy(addr, upstreamFromArgs())
 	// 规则表不再单列一份硬编码名单：modeOf 直接查策略表，
 	// 这样 strategy.json 里手工/自动加的域名才会真正生效（之前只影响 PAC，
 	// 走 SOCKS5 的客户端根本不读 PAC，就看策略表）。
@@ -301,4 +293,32 @@ func shortVerdict(s string) string {
 		return "EMPTY"
 	}
 	return s
+}
+
+// setupProxy 建 Proxy 并挂策略表；proxy 与 tun 两种模式共用同一套逻辑。
+func setupProxy(addr, upstream string) *Proxy {
+	p := NewProxy(addr)
+	// 上游代理可选：显式传了就转给它，不传就直连。
+	// 别人机器上没装 Clash，硬编码默认值会让他所有非分片流量打到空端口上。
+	if upstream != "" {
+		p.Upstream = upstream
+		logf("兜底上游: %s（不在分片名单的流量走这里）", upstream)
+	} else {
+		logf("兜底上游: 无（不在分片名单的流量直连）")
+	}
+
+	// 策略表：内置实测结果 + strategy.json 覆盖
+	strat := builtinStrategy()
+	if err := strat.Load(filepath.Join(exeDir(), "strategy.json")); err == nil {
+		logf("已加载 strategy.json")
+	}
+	p.Strategy = strat
+	return p
+}
+
+func upstreamFromArgs() string {
+	if len(os.Args) > 3 {
+		return os.Args[3]
+	}
+	return ""
 }
