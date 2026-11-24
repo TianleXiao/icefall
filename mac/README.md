@@ -153,18 +153,57 @@ cd Icefall-mac && bash install.sh
 
 ---
 
+## 另一种装法：Homebrew
+
+不想跑脚本的话：
+
+```bash
+brew tap TianleXiao/icefall
+brew install icefall
+icefall discover
+icefall setproxy pac
+```
+
+从源码编译（formula 自动装 `go`）。`brew services start icefall` 可以替代 launchd 那份 plist。
+
+---
+
 ## 命令行
 
 ```bash
 ./icefall discover                    # 重新探测，更新 strategy.json
 ./icefall proxy 127.0.0.1:8899        # 前台跑代理（调试用）
 ./icefall proxy 127.0.0.1:8899 127.0.0.1:7890   # 带兜底上游
-./icefall setproxy 127.0.0.1:8899     # 设系统代理
+./icefall setproxy 127.0.0.1:8899     # 设固定系统代理
+./icefall setproxy pac                # 设 PAC（推荐，自动分流）
 ./icefall unsetproxy                  # 还原
 ./icefall autostart proxy 127.0.0.1:8899        # 装开机自启
 ./icefall noautostart                 # 移除
 ./icefall check                       # 经代理实测一批域名
+./icefall help                        # 全部子命令
 ```
+
+端口 `8899` 同时是 HTTP 代理、SOCKS5 代理和 PAC 服务器：
+
+```bash
+curl --socks5-hostname 127.0.0.1:8899 https://www.bilibili.com
+```
+
+支持 SOCKS5 的程序（很多命令行工具、部分客户端的「自定义代理」）直接把地址填
+`127.0.0.1:8899`、类型选 SOCKS5 即可，同一个端口不用改。
+
+---
+
+## 不读系统代理的程序
+
+微信客户端、游戏启动器这类完全不看系统设置，PAC 和固定代理都管不到。
+macOS 上唯一的正路是 NetworkExtension 透明代理，源码骨架在
+[`NetworkExtension/`](NetworkExtension/README.md)，需要 Apple Developer 账号（99 美元/年）
+和 entitlement 审核，且必须在 Mac 上用 Xcode 构建。
+
+它选的是 `NEAppProxyProvider` 而不是 `NEPacketTunnelProvider`——因为前者拿到的已经是
+组装好的 flow（host + port），直接转给本地 SOCKS5 就行，不需要用户态 TCP/IP 栈。
+代价是 UDP 目前不接管。
 
 ---
 

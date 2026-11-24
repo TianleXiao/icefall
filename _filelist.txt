@@ -13,8 +13,14 @@ exec.go
 frag.go
 go.mod
 go.sum
+icefall.exe~
 mac/Info.plist
 mac/Install-Icefall.command
+mac/NetworkExtension/AppProxyProvider.entitlements
+mac/NetworkExtension/AppProxyProvider.swift
+mac/NetworkExtension/README.md
+mac/NetworkExtension/Socks5.swift
+mac/NetworkExtension/TunnelInstaller.swift
 mac/README.md
 mac/activate.command
 mac/app-launcher.sh

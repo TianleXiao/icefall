@@ -148,6 +148,7 @@ func (p *Proxy) handle(conn net.Conn) {
 		return
 	}
 
+	fmt.Fprintf(conn, "HTTP/1.1 200 Connection Established\r\n\r\n")
 	logf("CONNECT %s  fragment", host)
 	if err := p.fragmentTunnel(conn, br, host, port); err != nil {
 		logf("CONNECT %s  %v", host, err)

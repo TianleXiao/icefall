@@ -23,3 +23,10 @@ __pycache__/
 
 # 推送脚本（含本机路径）
 push_api.py
+
+# tap 单独放 homebrew-icefall 仓库
+tap/
+
+# 冒烟测试残留
+smoke.*
+pac.txt

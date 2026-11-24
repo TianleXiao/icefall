@@ -122,9 +122,38 @@ func main() {
 			list = checkTargets
 		}
 		printCheckAll(addr, list)
+	case "help", "-h", "--help":
+		printUsage()
 	default:
-		fmt.Println("usage: icefall [proxy|discover|check|setproxy|unsetproxy|autostart|noautostart|frag|cut|perip|filecut]")
+		printUsage()
 	}
+}
+
+// printUsage 打印可用子命令。
+//
+// 端口 8899 同时是 HTTP 代理、SOCKS5 代理和 PAC 服务器：
+// SOCKS5 靠首字节 0x05 区分，PAC 靠路径 /proxy.pac 区分，三者不冲突。
+func printUsage() {
+	fmt.Println(`usage: icefall <command> [args]
+
+  proxy [addr] [upstream]  启动代理（默认 127.0.0.1:8899；upstream 为兜底 HTTP 代理，如 Clash 的 127.0.0.1:7897）
+  discover                 探测本机网络封锁情况，生成 strategy.json
+  check [domain...]        经本地代理逐个验证站点是否可打开
+  pac                      打印生成的 PAC
+  setproxy [addr|pac]      设置系统代理（pac 表示走 PAC 自动分流）
+  unsetproxy               还原系统代理
+  autostart [args...]      写开机自启
+  noautostart              取消开机自启
+
+  probe <domain>           单域名三级判定：DNS / TCP / TLS
+  cut <domain>             扫单域名的有效分片切点
+  frag <domain>            分片可行性测试
+  perip <domain>           逐 IP 分片测试
+
+代理端口同时支持：
+  HTTP  CONNECT           http://127.0.0.1:8899
+  SOCKS5                  socks5://127.0.0.1:8899
+  PAC                     http://127.0.0.1:8899/proxy.pac`)
 }
 
 // checkTargets 是 check 子命令的默认待测清单：被学校封的、常用国内站、以及境外站。
