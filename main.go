@@ -122,6 +122,20 @@ func main() {
 			list = checkTargets
 		}
 		printCheckAll(addr, list)
+	case "probe":
+		// 单域名三级判定：DNS / TCP / TLS，并给出是否值得分片的建议
+		if len(os.Args) < 3 {
+			printUsage()
+			return
+		}
+		for _, d := range os.Args[2:] {
+			r := Probe(d, 6*time.Second)
+			fmt.Printf("%-36s %-12s %6dms  %s\n", r.Domain, r.Verdict, r.Latency.Milliseconds(), r.ResolvedIP)
+			if r.Verdict == SNIBlocked {
+				rw := RewriteProbe(d, "www.baidu.com", 6*time.Second)
+				fmt.Printf("%-36s 分片后: %-12s %s\n", "", rw.Verdict, rw.Err)
+			}
+		}
 	case "help", "-h", "--help":
 		printUsage()
 	default:
@@ -194,13 +208,9 @@ func runProxy() {
 		logf("已加载 strategy.json")
 	}
 	p.Strategy = strat
-	// 把策略灌进代理的规则表
-	for _, d := range defaultTargets {
-		p.SetRule(d, Rule{Fragment: true})
-	}
-	for _, d := range []string{"short.weixin.qq.com", "long.weixin.qq.com"} {
-		p.SetRule(d, Rule{Fragment: false}) // 走兜底上游
-	}
+	// 规则表不再单列一份硬编码名单：modeOf 直接查策略表，
+	// 这样 strategy.json 里手工/自动加的域名才会真正生效（之前只影响 PAC，
+	// 走 SOCKS5 的客户端根本不读 PAC，就看策略表）。
 
 	// 备份/设置系统代理由 activate.bat 完成：
 	// 沙箱环境会按进程树拦截注册表写入，exe 自己写必然 Access is denied。

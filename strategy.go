@@ -75,6 +75,29 @@ func (s *Strategy) Get(host string) Mode {
 	return ModeDirect
 }
 
+// GetKnown 同 Get，但额外告诉调用方「表里到底有没有这个域名」。
+// 代理需要区分「明确标了直连」和「完全没见过」——后者才值得自动学分片。
+func (s *Strategy) GetKnown(host string) (Mode, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	best := ""
+	for k := range s.entries {
+		if host == k {
+			return s.entries[k], true
+		}
+		if len(host) > len(k)+1 && host[len(host)-len(k)-1] == '.' &&
+			host[len(host)-len(k):] == k {
+			if len(k) > len(best) {
+				best = k
+			}
+		}
+	}
+	if best != "" {
+		return s.entries[best], true
+	}
+	return ModeDirect, false
+}
+
 // Save 写入 JSON，便于用户编辑。格式与 discover 写出的保持一致。
 func (s *Strategy) Save(path string) error {
 	s.mu.Lock()

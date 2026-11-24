@@ -73,11 +73,30 @@ func buildPAC(strat *Strategy, proxyAddr string) string {
 	return b.String()
 }
 
+// pacText 返回生成的 PAC，并缓存。
+//
+// 浏览器每次导航都可能回来取 PAC，重新拼一遍没意义；
+// 策略表变了（自动学习新域名）才 invalidate 重算。
+func (p *Proxy) pacText() string {
+	p.pacMu.Lock()
+	defer p.pacMu.Unlock()
+	if p.pacStr == "" {
+		p.pacStr = buildPAC(p.Strategy, pacAddr(p.Addr))
+	}
+	return p.pacStr
+}
+
+func (p *Proxy) invalidatePAC() {
+	p.pacMu.Lock()
+	p.pacStr = ""
+	p.pacMu.Unlock()
+}
+
 // servePAC 把 PAC 脚本回给请求方。
 func (p *Proxy) servePAC(conn interface {
 	Write([]byte) (int, error)
 }, _ *http.Request) {
-	body := buildPAC(p.Strategy, pacAddr(p.Addr))
+	body := p.pacText()
 	hdr := fmt.Sprintf(
 		"HTTP/1.1 200 OK\r\n"+
 			"Content-Type: application/x-ns-proxy-autoconfig\r\n"+

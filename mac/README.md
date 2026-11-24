@@ -1,257 +1,196 @@
-# 碎冰 Icefall —— macOS 版
+# 碎冰 Icefall
 
-绕开校园网 / 单位网对网站的封锁。不改 DNS、不改证书、不装内核扩展。
+用 TLS record 分片绕过校园网 / 企业网的 SNI 封锁。Windows + macOS。
 
-**只对 HTTP/HTTPS 生效**（浏览器、大部分 App）。走 UDP 的东西（游戏串流、部分语音）需要 TUN，这一版没有。
-
----
-
-## 开始
-
-**双击 `Install-Icefall.command`。** 完事。
-
-它自己会做四件事：
-
-1. 如果你还在下载目录或桌面，把自己整套搬到 `~/Icefall`（免得被清理工具删掉）
-2. 补可执行权限、去掉 Gatekeeper 的 quarantine 属性
-3. 探测本机封锁情况、装后台服务、设 PAC 系统代理
-4. 打印结果
-
-全程不到 20 秒，只有一个终端窗口，跑完可以关。
-
-### 被 Gatekeeper 挡住的话
-
-提示「无法打开，因为来自身份不明的开发者」→ 系统设置 → 隐私与安全性 → 最下面「仍要打开」。
-
-或者干脆绕开，在终端里跑：
-
-```bash
-cd ~/Downloads && xattr -dr com.apple.quarantine Icefall-mac
-cd Icefall-mac && bash install.sh
-```
-
-装完多出一个 **`Icefall.app`**——双击就启动，不弹终端窗口，不占 Dock（`LSUIElement`）。真正的后台服务由 launchd 管着，双击 app 只是手动确认它在跑。
+不需要服务器，不需要境外节点，不碰加密内容。
+同一个 WiFi 下别的设备被封，你这台能开。
 
 ---
 
-## 代理方式：PAC 自动分流，不是固定代理
+## 它解决什么
 
-系统代理设成 **PAC**（`networksetup -setautoproxyurl`），指向 `http://127.0.0.1:8899/proxy.pac`——这个 PAC 是程序**按 `strategy.json` 现生成**的。
+很多学校的网关不封 IP、不封端口，只做一件事：**检查 TLS ClientHello 里的明文 SNI**，看到黑名单里的域名就回一个 RST，连接当场断。
 
-好处很直接：
+表现是：
 
-| | 固定代理 | PAC |
-|---|---|---|
-| 百度、GitHub 这些没被封的 | 也要绕经 8899 | **DIRECT，完全不经过** |
-| 被封的站 | 走 8899 | 走 8899 |
-| 系统侧设置 | web + secure + bypass 三项逐项配 | 一个 autoproxy URL |
-| 换了策略表 | 要手改设置 | 重启服务自动重生成 |
+- `ping` 通、TCP 443 能连
+- 浏览器报 `ERR_CONNECTION_RESET` / `连接已重置`
+- 换一台不在黑名单的机器或换手机流量，同一个站能开
 
-性能上，固定代理让**所有**流量都进本程序拷贝一遍；PAC 之后只有真正需要分片的域名才进来，其余直连。这是这一版比 v1 更优雅的地方。
+碎冰的做法：在 ClientHello 发出去之前，把它**切成两个 TLS record**。
+SNI 字符串被劈成两半落在不同 record 里，检测设备抓不到完整域名；到服务器那边再拼回去，握手完全正常。
 
-想退回固定代理：
+只改「怎么发」，不改「发什么」，所以 TLS 1.3 的 transcript 一致，不会出现 `bad record MAC`。
 
-```bash
-./icefall setproxy 127.0.0.1:8899
-```
+## 为什么不是改 SNI
 
-想看 PAC 长什么样：
+改 SNI 字节是最直觉的想法，但**数学上不成立**：
 
-```bash
-./icefall pac | head -20
-```
+RFC 8446 里 `Transcript-Hash(ClientHello)` 参与 key schedule 派生。
+服务端拿改过的 hello 算，客户端拿自己发的原始 hello 算 → 两边 `client_handshake_traffic_secret` 不同 → 所有应用数据 MAC 全错。
 
----
+实测三种客户端全挂：
 
-## 它自动做了什么
-
-| 步骤 | 做什么 |
+| 客户端 | 报错 |
 |---|---|
-| 探测 | 拿本机网络挨个试 36 个国内常见站，分成「没被封 / 分片能救 / 救不了 / 解析失败」四档，结果写进 `strategy.json` |
-| 起服务 | 在 `127.0.0.1:8899` 起一个本地 HTTP 代理，后台常驻 |
-| 系统代理 | 对每个网络服务（Wi-Fi、Ethernet、雷雳网桥…）执行 `networksetup -setwebproxy` / `-setsecurewebproxy` |
-| 开机自启 | 写 `~/Library/LaunchAgents/com.icefall.proxy.plist`，登录即启动 |
+| Python ssl | `DECRYPTION_FAILED_OR_BAD_RECORD_MAC` |
+| Go crypto/tls | `local error: tls: bad record MAC` |
+| Windows schannel | `SEC_E_DECRYPT_FAILURE (0x80090330)` |
 
-原来这些位置的代理设置会被记进 `proxy-backup.json`，卸载时还原。
+分片没有这个问题：内容一个字节没动。
 
----
+## 安装
 
-## 原理
+### Windows
 
-学校多数是用**深度包检测**按 TLS 握手里的 SNI 字段精确阻断：它看见 `ClientHello` 里写着 `www.bilibili.com` 就回一个 RST，连接立刻断。
+1. 下载 `Icefall-v1.zip`，解压到 `C:\Icefall\`（别放桌面或下载目录，清理工具会删）
+2. 双击 `activate.bat`
+   - 第一次会自己跑一遍探测（约 5 秒），生成本机专用的 `strategy.json`
+   - 然后用 `reg add` 把系统代理指向 `127.0.0.1:8899`
+3. 开浏览器
 
-绕过办法不是伪装 SNI，而是**把 ClientHello 拆成两个 TCP 记录分两次发出去**。内容一个字没改，所以 TLS 1.3 的握手校验完全一致；但检测器要在单个包/单条记录里找那个完整域名，拆开之后就找不到了。
+卸载：双击 `uninstall.bat`。
 
-- 只改「怎么发」，不改「发什么」→ 不会触发 MAC 错误、不会掉证书
-- 服务器收到拼起来的完整握手，毫无察觉
-- 每个域名的最佳切点不同（取决于客户端 hello 的结构），所以程序会**从中间向两侧逐字节试**，直到握手成功
+### macOS
 
-检测器规则不透明，同域名不同客户端（Safari / Chrome / curl）的 hello 长度和偏移都不一样，所以是「实测」而不是「公式」。
+1. 下载 `Icefall-mac.tar.gz`，解压
+2. 双击 `Install-Icefall.command`
+   - 第一次被 Gatekeeper 拦 → 右键「打开」→ 再点「打开」
+   - 会自动搬到 `~/Icefall`、用 `lipo` 合成 universal2、建 `Icefall.app`、装 launchd 开机自启、设 PAC
+3. 开浏览器
 
----
+卸载：`~/Icefall/uninstall.command`。
+
+## 它做了什么
+
+```
+浏览器 ──PAC/系统代理──> 127.0.0.1:8899 碎冰 ──分片──> 目标站
+                                │
+                                └──不在策略表──> 兜底上游（Clash）或直连
+```
+
+- **PAC 自动分流**：只把策略表里的域名导进碎冰，其余 DIRECT。百度、GitHub 不会多绕一跳。
+- **切点并发竞速 + 缓存**：检测规则不透明，不同站点有效切点不同（B站 `+4~+15`，bilivideo CDN `+16~+25`）。首次连接同时发 4 个切点，谁先收到 ServerHello 就用谁；命中的切点按「域名 + ClientHello 长度 + SNI 偏移」缓存，同一页面后续几十个连接直接一次打中。
+- **自动学习未收录站点**：策略表里没有的域名不再干等上游。先直连嗅一下（1.2 秒），通了就记住 direct；不通就读 ClientHello 让分片和上游同时竞速，哪个先通就用哪个。分片赢的会**立刻写进 `strategy.json`**，下次直接命中。所以你不用预先准备域名清单，正常上网它就自己长出来。
+- **IP 层不通直接走上游**：TCP 都连不上的站（境外 IP 被封），分片帮不上忙，不再白试 4 个切点，直接交给上游。
+- **兜底上游**：不在策略表里的流量整条转给 Clash，境外站原有能力不受影响。没装 Clash 也能用（纯直连）。
 
 ## 生效范围
 
-**生效**：Safari、Chrome、Edge、大部分走系统代理的 App；终端里手动设了 `https_proxy` 的命令。
-
-**不生效**：微信、游戏客户端、串流软件 —— 它们不读系统代理。这些要 TUN 模式，这一版没有。
-
----
-
-## 探测结果怎么读
-
-`install.sh` 跑完会打印四行统计：
-
-```
-分片可绕 25      ← 被封了，但分片能过（这是主力）
-分片救不了 2     ← 学校封 + 服务器也挑 SNI，只能走境外/国内中转
-未判定 1        ← 域名本身解析不出来
-未封锁 8        ← 本来就能开，直连即可
-```
-
-想看明细：`./icefall discover`。
-
----
-
-## 策略表 strategy.json
-
-```json
-{ "entries": {
-    "bilibili.com": "fragment",
-    "short.weixin.qq.com": "upstream",
-    "www.baidu.com": "direct"
-  } }
-```
-
-三种模式：
-
-- `fragment` —— 分片。**主力**，不用服务器，延迟不增加。
-- `upstream` —— 整条转给兜底上游（安装时自动探测 7897 / 7890 / 7891 / 1080，通常是你已有的 Clash）。分片救不了的走这个。
-- `direct` —— 直连。没被封的别浪费性能。
-
-后缀匹配，写 `bilibili.com` 就覆盖所有子域。想临时禁用某个站，改成 `direct` 即可。
-
-没装 Clash 也能用，只是 `upstream` 那几条会失败。
-
----
-
-## 文件表
-
-| 文件 | 说明 |
+| 类别 | 说明 |
 |---|---|
-| `Icefall.app` | 双击启动（不想开终端时用） |
-| `icefall` | 实际跑的可执行文件，安装时用 `lipo` 合出的 universal2 |
-| `icefall-darwin-arm64` | Apple Silicon (M1/M2/M3/M4) |
-| `icefall-darwin-amd64` | Intel Mac |
-| `install.sh` | 安装（唯一入口） |
-| `install.command` | 双击包装 |
-| `activate.command` | 重启代理服务 |
-| `uninstall.command` | 还原系统代理、移除自启、结束进程 |
-| `strategy.json` | 策略表，PAC 由它生成，可手改 |
-| `proxy-backup.json` | 原始代理设置备份 |
-| `proxy.log` | 运行日志 |
-
----
-
-## 另一种装法：Homebrew
-
-不想跑脚本的话：
-
-```bash
-brew tap TianleXiao/icefall
-brew install icefall
-icefall discover
-icefall setproxy pac
-```
-
-从源码编译（formula 自动装 `go`）。`brew services start icefall` 可以替代 launchd 那份 plist。
-
----
+| 浏览器 | 全自动（读系统代理 / PAC） |
+| 走系统代理的程序 | 自动 |
+| 支持 SOCKS5 的程序 | 手动填 `127.0.0.1:8899`，同一个端口，协议自动识别，判定逻辑与浏览器完全一致（含自动学习） |
+| 完全不读代理的程序 | 微信客户端、部分游戏启动器：**需要 TUN，尚未实现** |
+| UDP 流量 | 未实现（走 Clash TUN） |
 
 ## 命令行
 
 ```bash
-./icefall discover                    # 重新探测，更新 strategy.json
-./icefall proxy 127.0.0.1:8899        # 前台跑代理（调试用）
-./icefall proxy 127.0.0.1:8899 127.0.0.1:7890   # 带兜底上游
-./icefall setproxy 127.0.0.1:8899     # 设固定系统代理
-./icefall setproxy pac                # 设 PAC（推荐，自动分流）
-./icefall unsetproxy                  # 还原
-./icefall autostart proxy 127.0.0.1:8899        # 装开机自启
-./icefall noautostart                 # 移除
-./icefall check                       # 经代理实测一批域名
-./icefall help                        # 全部子命令
+icefall proxy [addr] [upstream]   # 启动代理，默认 127.0.0.1:8899
+icefall discover                  # 探测本机网络，生成 strategy.json
+icefall check                     # 经代理逐个验证站点
+icefall pac                       # 打印生成的 PAC
+icefall setproxy [addr|pac]       # 设系统代理
+icefall unsetproxy                # 还原
+icefall autostart [args...]       # 开机自启
+icefall noautostart               # 取消自启
+icefall probe <domain>            # 单域名三级判定：DNS / TCP / TLS
+icefall cut <domain>              # 扫单域名有效切点
 ```
 
-端口 `8899` 同时是 HTTP 代理、SOCKS5 代理和 PAC 服务器：
+## SOCKS5
+
+`127.0.0.1:8899` 同时是 HTTP 代理和 SOCKS5 代理，靠首字节区分（SOCKS5 是 `0x05`，HTTP 方法全是 ASCII）。
 
 ```bash
 curl --socks5-hostname 127.0.0.1:8899 https://www.bilibili.com
 ```
 
-支持 SOCKS5 的程序（很多命令行工具、部分客户端的「自定义代理」）直接把地址填
-`127.0.0.1:8899`、类型选 SOCKS5 即可，同一个端口不用改。
+UDP ASSOCIATE 未实现，会明确回 `0x07 command not supported`，不会假装支持然后静默丢包。
 
----
+SOCKS5 和 HTTP 走的是同一套判定：查策略表 → 查运行时记忆 → 未收录就现场研判并学习。实测（本校网络）：
 
-## 不读系统代理的程序
+| 目标 | HTTP 代理 | SOCKS5 |
+|---|---|---|
+| bilibili（分片） | 161 ms | 141 ms |
+| 抖音（分片） | 149 ms | 186 ms |
+| 知乎（直连） | 137 ms | 228 ms |
+| youtube（上游） | 6.9 s | 6.9 s |
 
-微信客户端、游戏启动器这类完全不看系统设置，PAC 和固定代理都管不到。
-macOS 上唯一的正路是 NetworkExtension 透明代理，源码骨架在
-[`NetworkExtension/`](NetworkExtension/README.md)，需要 Apple Developer 账号（99 美元/年）
-和 entitlement 审核，且必须在 Mac 上用 Xcode 构建。
+## 实测（本校网络，29 个域名）
 
-它选的是 `NEAppProxyProvider` 而不是 `NEPacketTunnelProvider`——因为前者拿到的已经是
-组装好的 flow（host + port），直接转给本地 SOCKS5 就行，不需要用户态 TCP/IP 栈。
-代价是 UDP 目前不接管。
+`icefall check` 一次跑完，可打开 18 / 可疑 10（301、302、403、444 全是站点自己的风控，正常）/ 打不开 1（twitter，上游节点问题）。
 
----
+关键延迟（冷启动 → 缓存命中）：
 
-## 排查
+| 目标 | 优化前 | 现在 |
+|---|---|---|
+| www.bilibili.com | 767 ms | 145 ms |
+| www.facebook.com | 2988 ms | 1641 ms |
+| api.github.com | 4258 ms | 1448 ms |
+| www.google.com | 5073 ms | 2006 ms（首连 3.5 s） |
+| registry.npmjs.org | 1731 ms | 794 ms |
+| claude.ai | 1804 ms | 708 ms |
 
-**双击 install.command 提示「无法打开，因为来自身份不明的开发者」**
+## 探测结果怎么读
 
-系统拦了未签名程序。两条路：
+`icefall discover` 输出四档：
 
-1. 系统设置 → 隐私与安全性 → 底部「仍要打开」
-2. 或者直接在终端跑 `bash install.sh`（这样不经过 Gatekeeper）
+| 结果 | 含义 | 处理 |
+|---|---|---|
+| 未封锁 | 真 SNI 直连就通 | 走 DIRECT |
+| 分片可绕 | 真 SNI 被 RST，分片后握手成功 | `fragment` |
+| 分片救不了 | 所有切点都 RST，或服务器只认白名单 SNI | `upstream` |
+| 未判定 | DNS 解析失败（域名本身不存在） | 跳过 |
 
-**装完浏览器还是打不开 B 站**
+`strategy.json` 就是这张表，可以手改：
 
-先确认代理活着：
-
-```bash
-nc -z 127.0.0.1 8899 && echo alive
-tail -30 proxy.log
+```json
+{
+  "entries": {
+    "bilibili.com": "fragment",
+    "short.weixin.qq.com": "upstream"
+  }
+}
 ```
 
-日志里应该有 `fragment@1XX OK (try N/M)`。如果全是 `fragment@.. RST`，说明这个站的切点规律变了，跑 `./icefall discover` 重扫。
+匹配规则是后缀匹配，`bilibili.com` 覆盖 `www.bilibili.com` / `api.bilibili.com` / `cn-jsnt-ct-01-02.bilivideo.com` 之外的所有子域。
 
-**终端里 curl 打不开**
-
-终端不读系统代理，手动设：
+## 编译
 
 ```bash
-export https_proxy=http://127.0.0.1:8899
-export http_proxy=http://127.0.0.1:8899
+go build -o icefall.exe .
+GOOS=darwin GOARCH=arm64 go build -o icefall-darwin-arm64 .
+GOOS=darwin GOARCH=amd64 go build -o icefall-darwin-amd64 .
 ```
 
-**Safari 打不开但 Chrome 能开**
+依赖只有 `utls`（拿 Chrome 的 ClientHello 指纹）。分片逻辑是纯 `net` + 字节操作，与平台无关。
 
-Safari 有时会缓存连接。关掉重开，或者清理 `~/Library/Caches/com.apple.Safari`。
-
-**想彻底卸载**
-
-```bash
-bash uninstall.command   # 或者双击
-rm -rf ~/Icefall         # 删目录
-```
-
----
+打包 macOS 包必须用 `pack_mac.py`：Windows 的 bsdtar 存不了 POSIX 权限位，`.command` 解压到 Mac 后双击会报没有执行权限。
 
 ## 已知边界
 
-- 走 UDP 的（游戏串流、WebRTC、部分语音）—— 抓不到，需要 TUN
-- 微信内置浏览器/视频号 —— 不读系统代理，需要 TUN
-- 纯境外站（Google / YouTube）—— 学校同时封了 IP 层，分片救不了，必须境外中转
-- 学校如果以后改成按 IP 段封或者全量 TLS 代理，这招失效
+- **TUN 未实现**。gVisor 的 `pkg/tcpip/stack` 在 Go 1.27 下编译失败（`found packages stack and bridge`，来自 `bridge_test.go` 声明 `package bridge_test`；且 `pkg/sync` 的 codegen 只覆盖到 go1.26），Windows 建 TUN 网卡还要管理员权限。代码在 `_tun_wip/`，架构已画好，缺一个能编译的用户态栈。
+- **UDP 未实现**。海马云电脑、部分游戏的串流走 UDP/WebRTC，HTTP 代理和 SOCKS5 TCP 都碰不到。
+- **微信视频号在客户端内不通**。微信不读系统代理，`short/long.weixin.qq.com` 且是「学校 RST + 腾讯只认白名单 SNI」双重限制，分片救不了，只能上游。
+- **境外站靠上游，不靠分片**。`google.com` / `youtube.com` 是 DNS 污染 + IP 层封锁，分片救不了（实测 `www.google.com` 被解析到 Twitter 的 IP，真实 IP 的 443 也不通）。未收录时会自动判到 upstream 并记住，前提是配了兜底上游（Clash）；没配就只剩直连。
+
+## 目录
+
+```
+*.go              代理核心：proxy / snipatch / cuts / cutcache / strategy / pac / socks / discover
+sysproxy_*.go     平台层：系统代理、开机自启
+mac/              macOS 包脚本、Info.plist、app launcher
+_tun_wip/         TUN 模式半成品（未编译通过）
+CONCLUSION.md     为什么改 SNI 不成立的技术结论
+```
+
+## 免责
+
+只用于自己网络下恢复被误封的正常访问。别拿它做别的事。
+
+## License
+
+MIT

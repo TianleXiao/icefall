@@ -72,8 +72,11 @@ func (p *Proxy) handleSocks(conn net.Conn, br *bufio.Reader) {
 
 	switch req[1] {
 	case socksCmdConn:
-		rule, hit := p.lookup(host)
-		if hit && rule.Fragment {
+		// 和 HTTP 路径共用同一套策略判定：modeOf 会查手工规则 → 运行时 memo → strategy.json
+		mode, known := p.modeOf(host)
+
+		// 分片段：直接分片
+		if mode == ModeFragment || (mode == ModeUpstream && p.Upstream == "") {
 			if err := socksReply(conn, 0x00); err != nil {
 				return
 			}
@@ -84,9 +87,20 @@ func (p *Proxy) handleSocks(conn net.Conn, br *bufio.Reader) {
 			return
 		}
 
+		// 未收录：交给和 HTTP 一样的研判流程（直连嗅探 → 分片/上游并发 → 自动学习）
+		if !known {
+			if err := socksReply(conn, 0x00); err != nil {
+				return
+			}
+			p.tunnelUnknown(conn, br, host, strconv.Itoa(port))
+			return
+		}
+
 		var target net.Conn
-		if p.Upstream != "" {
+		via := "direct"
+		if mode == ModeUpstream {
 			target, err = p.dialViaUpstream(host, port)
+			via = "upstream " + p.Upstream
 		} else {
 			target, err = p.dialer.Dial("tcp", net.JoinHostPort(host, strconv.Itoa(port)))
 		}
@@ -99,13 +113,10 @@ func (p *Proxy) handleSocks(conn net.Conn, br *bufio.Reader) {
 		if err := socksReply(conn, 0x00); err != nil {
 			return
 		}
-		via := "direct"
-		if p.Upstream != "" {
-			via = "upstream " + p.Upstream
-		}
 		logf("SOCKS5 %s:%d  %s", host, port, via)
 		conn.SetDeadline(time.Time{})
 		target.SetDeadline(time.Time{})
+		flushBr(br, target)
 		tunnel(conn, target)
 
 	case socksCmdUDP:

@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -34,6 +35,15 @@ type Proxy struct {
 	mu     sync.RWMutex
 	rules  map[string]Rule
 	dialer *net.Dialer
+	cuts   *cutCache
+
+	// memo 是本次运行的「未收录域名」判定缓存：直连 / 分片 / 上游。
+	// 没有它，每个境外未知域名都要吃一次 1.2s 嗅探。
+	memoMu sync.RWMutex
+	memo   map[string]Mode
+
+	pacMu  sync.Mutex
+	pacStr string
 }
 
 type Rule struct {
@@ -48,6 +58,8 @@ func NewProxy(addr string) *Proxy {
 		Addr:   addr,
 		rules:  map[string]Rule{},
 		dialer: &net.Dialer{Timeout: 10 * time.Second},
+		cuts:   newCutCache(),
+		memo:   map[string]Mode{},
 	}
 }
 
@@ -125,34 +137,310 @@ func (p *Proxy) handle(conn net.Conn) {
 		host, port = req.Host, "443"
 	}
 
-	rule, hit := p.lookup(host)
-	if !hit || !rule.Fragment {
-		// 不在分片名单：有兜底上游就整条隧道转给上游（Clash），
-		// 没有就直连。这样别人机器上不装 Clash 也能用。
+	mode, known := p.modeOf(host)
+	switch {
+	case mode == ModeFragment:
+		fmt.Fprintf(conn, "HTTP/1.1 200 Connection Established\r\n\r\n")
+		logf("CONNECT %s  fragment", host)
+		if err := p.fragmentTunnel(conn, br, host, port); err != nil {
+			logf("CONNECT %s  %v", host, err)
+		}
+		return
+	case mode == ModeUpstream:
 		if p.Upstream != "" {
 			p.handleUpstream(conn, br, req)
 			return
 		}
-		target, err := p.dialer.Dial("tcp", net.JoinHostPort(host, port))
-		if err != nil {
-			fmt.Fprintf(conn, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
-			logf("CONNECT %s:%s  dial fail: %v", host, port, err)
-			return
-		}
-		defer target.Close()
+		// 没配上游：这一档本来是「分片救不了」，只能死马当活马试分片
 		fmt.Fprintf(conn, "HTTP/1.1 200 Connection Established\r\n\r\n")
-		logf("CONNECT %s  direct", host)
-		conn.SetDeadline(time.Time{})
-		target.SetDeadline(time.Time{})
-		tunnel(conn, target)
+		logf("CONNECT %s  upstream（未配上游，改试分片）", host)
+		if err := p.fragmentTunnel(conn, br, host, port); err != nil {
+			logf("CONNECT %s  %v", host, err)
+		}
+		return
+	case known:
+		// 明确标了直连：别再绕上游，白加一跳延迟
+		p.handleDirect(conn, br, host, port)
 		return
 	}
 
-	fmt.Fprintf(conn, "HTTP/1.1 200 Connection Established\r\n\r\n")
-	logf("CONNECT %s  fragment", host)
-	if err := p.fragmentTunnel(conn, br, host, port); err != nil {
-		logf("CONNECT %s  %v", host, err)
+	// 表里没有的域名：443 先直连嗅一下，被断了自动学分片，分片不行再甩上游
+	if port == "443" {
+		p.handleUnknown(conn, br, host, port)
+		return
 	}
+	if p.Upstream != "" {
+		p.handleUpstream(conn, br, req)
+		return
+	}
+	p.handleDirect(conn, br, host, port)
+}
+
+// modeOf 用一个域名决定怎么走。rules 手工项优先于策略表。
+func (p *Proxy) modeOf(host string) (Mode, bool) {
+	if r, ok := p.lookup(host); ok {
+		if r.Fragment {
+			return ModeFragment, true
+		}
+		return ModeUpstream, true
+	}
+	if m, ok := p.memoGet(host); ok {
+		return m, true
+	}
+	if p.Strategy != nil {
+		return p.Strategy.GetKnown(host)
+	}
+	return ModeDirect, false
+}
+
+func (p *Proxy) memoGet(host string) (Mode, bool) {
+	p.memoMu.RLock()
+	defer p.memoMu.RUnlock()
+	m, ok := p.memo[host]
+	return m, ok
+}
+
+func (p *Proxy) memoSet(host string, m Mode) {
+	p.memoMu.Lock()
+	p.memo[host] = m
+	p.memoMu.Unlock()
+}
+
+// handleDirect 直连，不做任何分片。
+func (p *Proxy) handleDirect(conn net.Conn, br *bufio.Reader, host, port string) {
+	target, err := p.dialer.Dial("tcp", net.JoinHostPort(host, port))
+	if err != nil {
+		fmt.Fprintf(conn, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
+		logf("CONNECT %s:%s  dial fail: %v", host, port, err)
+		return
+	}
+	defer target.Close()
+	fmt.Fprintf(conn, "HTTP/1.1 200 Connection Established\r\n\r\n")
+	logf("CONNECT %s  direct", host)
+	conn.SetDeadline(time.Time{})
+	target.SetDeadline(time.Time{})
+	// ReadRequest 之后 br 里可能还压着客户端已经发来的字节，先倒给目标
+	if n := br.Buffered(); n > 0 {
+		b, _ := br.Peek(n)
+		if _, err := target.Write(b); err != nil {
+			return
+		}
+		br.Discard(n)
+	}
+	tunnel(conn, target)
+}
+
+// handleUnknown 处理策略表里没有的 443 域名，三级降级：
+//
+//	1. 直连嗅一下目标首字节（1.2s）——通就直接用，绝大多数新站走这里
+//	2. 被 RST/无响应 → 试分片；通了就写进 strategy.json（下次直接命中，PAC 同步更新）
+//	3. 分片也不行 → 有上游就转发兜底
+//
+// 这是「新站不用手工加表」的那条路。
+func (p *Proxy) handleUnknown(conn net.Conn, br *bufio.Reader, host, port string) {
+	fmt.Fprintf(conn, "HTTP/1.1 200 Connection Established\r\n\r\n")
+	p.tunnelUnknown(conn, br, host, port)
+}
+
+// tunnelUnknown 是 handleUnknown 的正文，不含 HTTP 应答那一步 —— SOCKS5 也要用。
+func (p *Proxy) tunnelUnknown(conn net.Conn, br *bufio.Reader, host, port string) {
+
+	// 1) 直连嗅一下：通了就直接用，省掉一切猜测
+	target, derr := p.dialShort(net.JoinHostPort(host, port), 1500*time.Millisecond)
+	if derr == nil {
+		target.SetDeadline(time.Now().Add(1200 * time.Millisecond))
+		first := make([]byte, 4096)
+		n, rerr := target.Read(first)
+		if n > 0 {
+			target.SetDeadline(time.Time{})
+			conn.SetDeadline(time.Time{})
+			conn.Write(first[:n])
+			flushBr(br, target)
+			p.memoSet(host, ModeDirect)
+			logf("CONNECT %s  direct（未收录，直连通过，已记忆）", host)
+			tunnel(conn, target)
+			target.Close()
+			return
+		}
+		target.Close()
+		logf("CONNECT %s  直连无响应（%v，%s），分片/上游并发试", host, rerr, blockedWord(isBlockedErr(rerr)))
+	} else {
+		logf("CONNECT %s  直连失败（%v）", host, derr)
+	}
+
+	// 2) 读 ClientHello；读不出来说明不是 TLS，只能甩上游
+	conn.SetDeadline(time.Now().Add(15 * time.Second))
+	hello, herr := readClientHello(br)
+	if herr != nil {
+		logf("CONNECT %s  %v", host, herr)
+		if p.Upstream != "" {
+			if up, err := p.dialViaUpstream(host, atoiPort(port)); err == nil {
+				flushBr(br, up)
+				conn.SetDeadline(time.Time{})
+				p.memoSet(host, ModeUpstream)
+				logf("CONNECT %s  -> upstream %s（非 TLS，兜底，已记忆）", host, p.Upstream)
+				tunnel(conn, up)
+				up.Close()
+			}
+		}
+		return
+	}
+
+	// 3a) TCP 层就打不通 = 境外 IP 被封，分片救不了（分片只骗 SNI 检测，不打通 IP）
+	//     直接走上游，省掉白试 4 个切点的 4 秒。
+	if derr != nil && p.Upstream != "" {
+		up, uerr := p.dialViaUpstream(host, atoiPort(port))
+		if uerr != nil {
+			logf("CONNECT %s  upstream fail: %v", host, uerr)
+			return
+		}
+		up.Write(hello)
+		flushBr(br, up)
+		conn.SetDeadline(time.Time{})
+		p.memoSet(host, ModeUpstream)
+		logf("CONNECT %s  IP 层不通 → upstream %s（已记忆，跳过分片）", host, p.Upstream)
+		tunnel(conn, up)
+		up.Close()
+		return
+	}
+
+	// 3) 分片和上游同时试，谁先通就用谁
+	//    境外站分片必失败（IP 层封），串行试会白等一整个批次；国内站上游又不该碰。
+	tc, hdr, mode, cut, failed, err := p.openUnknown(host, port, hello)
+	for _, c := range failed {
+		p.cuts.markBad(host, hello, c)
+	}
+	if err != nil {
+		logf("CONNECT %s  %v", host, err)
+		return
+	}
+
+	switch mode {
+	case ModeFragment:
+		p.cuts.put(host, hello, cut)
+		conn.Write(hdr)
+		conn.SetDeadline(time.Time{})
+		tc.SetDeadline(time.Time{})
+		flushBr(br, tc)
+		logf("CONNECT %s  未收录 → 分片@%d 通了", host, cut)
+		tunnel(conn, tc)
+		tc.Close()
+		p.learn(host)
+	default:
+		flushBr(br, tc)
+		conn.SetDeadline(time.Time{})
+		p.memoSet(host, ModeUpstream)
+		logf("CONNECT %s  -> upstream %s（已记忆）", host, p.Upstream)
+		tunnel(conn, tc)
+		tc.Close()
+	}
+}
+
+// openUnknown 并发试「分片」和「上游」，返回先打通的那条。
+//
+// 未收录域名只试前 4 个切点：扫满全表要 3~4 批，收益远低于让 Clash 直接接走。
+func (p *Proxy) openUnknown(host, port string, hello []byte) (net.Conn, []byte, Mode, int, []int, error) {
+	type res struct {
+		conn   net.Conn
+		hdr    []byte
+		mode   Mode
+		cut    int
+		failed []int
+		err    error
+	}
+	cands := cutCandidates(hello)
+	if len(cands) > cutRaceBatch {
+		cands = cands[:cutRaceBatch]
+	}
+	hasUp := p.Upstream != ""
+	if !hasUp && len(cands) == 0 {
+		return nil, nil, "", 0, nil, fmt.Errorf("no cut candidate")
+	}
+
+	ch := make(chan res, 2)
+	if len(cands) > 0 {
+		go func() {
+			cut, tc, hdr, failed, err := p.raceCuts(host, port, hello, cands)
+			ch <- res{conn: tc, hdr: hdr, mode: ModeFragment, cut: cut, failed: failed, err: err}
+		}()
+	}
+	if hasUp {
+		go func() {
+			up, err := p.dialViaUpstream(host, atoiPort(port))
+			if err == nil {
+				if _, werr := up.Write(hello); werr != nil {
+					up.Close()
+					err = werr
+				}
+			}
+			ch <- res{conn: up, mode: ModeUpstream, err: err}
+		}()
+	}
+
+	want := 1
+	if hasUp && len(cands) > 0 {
+		want = 2
+	}
+	var failed []int
+	for i := 0; i < want; i++ {
+		r := <-ch
+		failed = append(failed, r.failed...)
+		if r.err != nil {
+			if r.conn != nil {
+				r.conn.Close()
+			}
+			continue
+		}
+		// 谁先通用谁：立刻返回，另一条后台收尾，绝不等它超时
+		go func(left int) {
+			for ; left < want; left++ {
+				if x := <-ch; x.conn != nil {
+					x.conn.Close()
+				}
+			}
+		}(i + 1)
+		return r.conn, r.hdr, r.mode, r.cut, failed, nil
+	}
+	return nil, nil, "", 0, failed, fmt.Errorf("fragment+upstream 都不通")
+}
+
+// isBlockedErr 判断这个错误像「被主动切断」而不是「服务器就是慢」。
+func isBlockedErr(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "reset")
+}
+
+func blockedWord(rst bool) string {
+	if rst {
+		return "被 RST"
+	}
+	return "更像超时"
+}
+
+// flushBr 把 bufio 里已经读进来的客户端字节倒给目标，避免吞包。
+func flushBr(br *bufio.Reader, w io.Writer) {
+	n := br.Buffered()
+	if n == 0 {
+		return
+	}
+	b, _ := br.Peek(n)
+	if _, err := w.Write(b); err == nil {
+		br.Discard(n)
+	}
+}
+
+// learn 把「这个域名需要分片」记进规则表和 strategy.json。
+func (p *Proxy) learn(host string) {
+	p.SetRule(host, Rule{Fragment: true})
+	if p.Strategy == nil {
+		return
+	}
+	p.Strategy.Set(host, ModeFragment)
+	if err := p.Strategy.Save(strategyPath()); err != nil {
+		logf("已发现 %s 需分片，但写 strategy.json 失败: %v", host, err)
+		return
+	}
+	p.invalidatePAC()
+	logf("已学习：%s → fragment（已写入 strategy.json）", host)
 }
 
 func (p *Proxy) handlePlainHTTP(conn net.Conn, br *bufio.Reader, req *http.Request) {
@@ -298,62 +586,78 @@ func (p *Proxy) fragmentTunnel(conn net.Conn, br *bufio.Reader, host, port strin
 	if err != nil {
 		return fmt.Errorf("read hello fail: %w", err)
 	}
+	return p.fragmentWith(conn, br, host, port, hello)
+}
 
+// fragmentWith 用已读出的 hello 做分片（handleUnknown 需要自己先读 hello 才能兜底上游）。
+func (p *Proxy) fragmentWith(conn net.Conn, br *bufio.Reader, host, port string, hello []byte) error {
 	rule, hit := p.lookup(host)
 	var cands []int
-	if hit && rule.Cut > 0 {
+	switch {
+	case hit && rule.Cut > 0:
 		cands = []int{rule.Cut}
-	} else {
-		cands = cutCandidates(hello)
-	}
-	if len(cands) == 0 {
-		cands = []int{len(hello) / 2}
+	default:
+		if c, ok := p.cuts.get(host, hello); ok {
+			cands = append(cands, c) // 缓存命中：第 1 个就试，通常一次成
+		}
+		cands = append(cands, cutCandidates(hello)...)
 	}
 
-	var good net.Conn
-	for i, c := range cands {
-		if c <= 5 || c >= len(hello)-5 {
+	// 去掉已确认的死点和越界点
+	use := make([]int, 0, len(cands))
+	seen := map[int]bool{}
+	for _, c := range cands {
+		if seen[c] || c <= 5 || c >= len(hello)-5 {
 			continue
 		}
-		tc, err := p.dialer.Dial("tcp", net.JoinHostPort(host, port))
-		if err != nil {
+		seen[c] = true
+		if p.cuts.isBad(host, hello, c) {
 			continue
 		}
-		tc.SetDeadline(time.Now().Add(6 * time.Second))
-		payload := fragmentHello(hello, c-5)
-		if _, err := tc.Write(payload); err != nil {
-			tc.Close()
-			continue
-		}
-		hdr := make([]byte, 5)
-		n, err := io.ReadFull(tc, hdr)
-		if err != nil || n < 5 {
-			tc.Close()
-			logf("  cut=%-4d RST/EOF", c)
-			continue
-		}
-		if hdr[0] == 0x15 {
-			tc.Close()
-			logf("  cut=%-4d ALERT", c)
-			continue
-		}
-		if hdr[0] != 0x16 {
-			tc.Close()
-			logf("  cut=%-4d unexpected type=0x%02x", c, hdr[0])
-			continue
-		}
-		good = tc
-		conn.Write(hdr)
-		logf("  fragment@%d OK  (try %d/%d)  %d->%d bytes  2 records",
-			c, i+1, len(cands), len(hello), len(payload))
-		break
+		use = append(use, c)
 	}
-	if good == nil {
-		return fmt.Errorf("all %d cuts failed", len(cands))
+	if len(use) == 0 {
+		return fmt.Errorf("no usable cut (len=%d)", len(hello))
 	}
-	defer good.Close()
-	good.SetDeadline(time.Time{})
+
+	cut, tc, hdr, failed, err := p.raceCuts(host, port, hello, use)
+	for _, c := range failed {
+		p.cuts.markBad(host, hello, c)
+	}
+	if err != nil {
+		return err
+	}
+	p.cuts.put(host, hello, cut)
+
+	conn.Write(hdr)
+	logf("  fragment@%d OK  %d->%d bytes  2 records", cut, len(hello), len(hello)+5)
+	defer tc.Close()
+	tc.SetDeadline(time.Time{})
 	conn.SetDeadline(time.Time{})
-	tunnel(conn, good)
+
+	// 客户端在 hello 之后可能已经又发了数据（Early Data / 第二段 record），先倒过去
+	if n := br.Buffered(); n > 0 {
+		b, _ := br.Peek(n)
+		if _, err := tc.Write(b); err != nil {
+			return err
+		}
+		br.Discard(n)
+	}
+	tunnel(conn, tc)
 	return nil
+}
+
+// atoiPort 把端口字符串转成 int，解析失败退回 443。
+func atoiPort(s string) int {
+	if n, err := strconv.Atoi(s); err == nil {
+		return n
+	}
+	return 443
+}
+
+// dialShort 用更短的超时拨号：未收录域名探测时不能沿用 10s，
+// 否则一个坏 IP 就把整条连接拖到客户端超时。
+func (p *Proxy) dialShort(addr string, d time.Duration) (net.Conn, error) {
+	dd := &net.Dialer{Timeout: d}
+	return dd.Dial("tcp", addr)
 }
