@@ -33,14 +33,12 @@ pack_mac.py
 paths.go
 perip.go
 probe.go
-proxy.err
 proxy.go
-py_patched.bin
 rewrite.go
 snipatch.go
-socks-test.err
 socks.go
 strategy.go
 sysproxy_darwin.go
 sysproxy_windows.go
 uninstall.bat
+cutcache.go
