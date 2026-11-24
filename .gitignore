@@ -17,3 +17,9 @@ dumps/
 # Python 缓存
 __pycache__/
 *.pyc
+
+# 抓包样本
+*.bin
+
+# 推送脚本（含本机路径）
+push_api.py
