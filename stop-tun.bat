@@ -19,7 +19,9 @@ taskkill /f /im icefall.exe >nul 2>&1
 
 echo  Removing TUN routes (0.0.0.0/1, 128.0.0.0/1)...
 netsh interface ipv4 delete route prefix=0.0.0.0/1 interface="Icefall" store=active >nul 2>&1
+netsh interface ipv4 delete route prefix=0.0.0.0/1 interface="Icefall" >nul 2>&1
 netsh interface ipv4 delete route prefix=128.0.0.0/1 interface="Icefall" store=active >nul 2>&1
+netsh interface ipv4 delete route prefix=128.0.0.0/1 interface="Icefall" >nul 2>&1
 
 echo  Re-enabling normal DNS/proxy state...
 icefall.exe unsetproxy >nul 2>&1

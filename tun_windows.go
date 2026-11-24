@@ -120,8 +120,12 @@ func setupTunNet() error {
 
 func cleanupTunNet() {
 	for _, pfx := range []string{"0.0.0.0/1", "128.0.0.0/1"} {
-		cmdOut("netsh", "interface", "ipv4", "delete", "route",
-			"prefix="+pfx, "interface="+tunIfaceName, "store=active")
+		// store=active 删不掉就再按默认（持久）删一次，否则残留路由等于整机断网
+		if _, err := cmdOut("netsh", "interface", "ipv4", "delete", "route",
+			"prefix="+pfx, "interface="+tunIfaceName, "store=active"); err != nil {
+			cmdOut("netsh", "interface", "ipv4", "delete", "route",
+				"prefix="+pfx, "interface="+tunIfaceName)
+		}
 	}
 	logf("已撤回 TUN 路由")
 }
