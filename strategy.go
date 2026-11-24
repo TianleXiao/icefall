@@ -152,6 +152,19 @@ func builtinStrategy() *Strategy {
 		s.Set(d, ModeUpstream)
 	}
 
+	// 境外 IP 层就不通（DNS 污染 + 真实 IP 的 443 也超时），分片骗得过 SNI 却打不通 IP，
+	// 只能整条转上游。列在这里是为了让 PAC 也能覆盖到——否则浏览器拿到 DIRECT 直接死在直连上。
+	for _, d := range []string{
+		"google.com", "youtube.com", "gstatic.com", "googleapis.com", "googleusercontent.com",
+		"googlevideo.com", "ggpht.com", "gvt1.com", "gvt2.com", "recaptcha.net",
+		"openai.com", "claude.ai", "anthropic.com",
+		"twitter.com", "x.com", "facebook.com", "instagram.com", "whatsapp.com",
+		"reddit.com", "wikipedia.org", "telegram.org", "discord.com",
+		"docker.com", "docker.io", "registry-1.docker.io",
+	} {
+		s.Set(d, ModeUpstream)
+	}
+
 	// 明确直连：国内没被封的、以及本地网络设备
 	for _, d := range []string{
 		"baidu.com", "zhihu.com", "taobao.com", "jd.com", "weibo.com",

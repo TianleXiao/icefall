@@ -97,6 +97,12 @@ func main() {
 			logf("已加载 strategy.json")
 		}
 		fmt.Print(buildPAC(strat, "127.0.0.1:8899"))
+	case "version", "--version", "-v":
+		// 版本号由 CI 在打 tag 时用 -ldflags 注入，用来判断要不要 update
+		fmt.Println(versionString())
+	case "update":
+		// 别人机器上的自助升级：icefall update [--check] [upstream]
+		runUpdate(os.Args[2:])
 	case "unsetproxy":
 		if err := ClearSystemProxy(); err != nil {
 			fmt.Printf("还原失败: %v\n", err)
@@ -159,6 +165,8 @@ func printUsage() {
   discover                 探测本机网络封锁情况，生成 strategy.json
   check [domain...]        经本地代理逐个验证站点是否可打开
   pac                      打印生成的 PAC
+  version                  显示版本号
+  update [--check] [up]    从 GitHub 拉最新版替换自身（--check 只查不装；up 为兜底代理）
   tun [addr] [upstream]    整机接管（TUN 模式，需管理员）：让不读系统代理的程序也生效
   tunclean                 清理 TUN 残留路由（进程被强杀后用）
   setproxy [addr|pac]      设置系统代理（pac 表示走 PAC 自动分流）
