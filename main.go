@@ -230,9 +230,12 @@ func runProxy() {
 
 	fmt.Println()
 	logf("=== 碎冰 v1 (Icefall) ===")
+	logf("版本 %s", versionString())
 	logf("监听 %s", addr)
 	logf("按 Ctrl+C 退出")
 	fmt.Println()
+
+	autoUpdateCheck(p.Upstream)
 
 	if err := p.Run(ctx); err != nil {
 		logf("exited: %v", err)

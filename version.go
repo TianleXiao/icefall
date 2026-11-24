@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -177,7 +178,11 @@ func runUpdate(args []string) {
 		os.Exit(1)
 	}
 	self, _ = filepath.EvalSymlinks(self)
+	// 重新执行用：argv[0] 可能是相对路径，重启必须给绝对路径。
+	self, _ = filepath.Abs(self)
 
+	// Windows 的 wintun.dll 和 strategy.json 跟 exe 同目录。只换 exe 不换 DLL 会撞版本不匹配，
+	// 所以 release 里带了 wintun.dll 就一起下。
 	tmp := self + ".new"
 	fmt.Printf("下载 %s (%d 字节)...\n", want, size)
 	if err := downloadFile(url, tmp, upstream); err != nil {
@@ -187,6 +192,9 @@ func runUpdate(args []string) {
 	}
 	if err := os.Chmod(tmp, 0o755); err != nil {
 		fmt.Printf("设置权限失败（macOS 可能可以忽略）: %v\n", err)
+	}
+	if runtime.GOOS == "windows" {
+		replaceDLL(self, rel, upstream)
 	}
 
 	// Windows 不能覆盖正在运行的文件，但能改名。当前进程继续用旧映像跑完，下次启动就是新的。
@@ -204,6 +212,7 @@ func runUpdate(args []string) {
 			os.Exit(1)
 		}
 		fmt.Printf("已更新到 %s。请重启 Icefall 生效（%s 可以删）。\n", rel.Tag, filepath.Base(bak))
+		restartAfterUpdate(self)
 		return
 	}
 	if err := os.Rename(tmp, self); err != nil {
@@ -212,6 +221,62 @@ func runUpdate(args []string) {
 		os.Exit(1)
 	}
 	fmt.Printf("已更新到 %s。重启 Icefall 生效。\n", rel.Tag)
+}
+
+// replaceDLL 下载 release 里的 wintun.dll 覆盖同目录旧版。
+// 不换 DLL 的话，新版 wintun API 可能和旧 DLL 对不上，TUN 模式会莫名失败。
+func replaceDLL(self string, rel *releaseInfo, upstream string) {
+	var url string
+	for _, a := range rel.Assets {
+		if a.Name == "wintun.dll" && a.Size > 0 {
+			url = a.URL
+			break
+		}
+	}
+	if url == "" {
+		return
+	}
+	dst := filepath.Join(filepath.Dir(self), "wintun.dll")
+	tmp := dst + ".new"
+	if err := downloadFile(url, tmp, upstream); err != nil {
+		os.Remove(tmp)
+		fmt.Printf("wintun.dll 更新跳过（%v），沿用现有版本。\n", err)
+		return
+	}
+	// 旧 DLL 可能被正在跑的 TUN 会话占用，改名再放新的，失败就保持原样。
+	os.Remove(dst + ".old")
+	if _, err := os.Stat(dst); err == nil {
+		if err := os.Rename(dst, dst+".old"); err != nil {
+			os.Remove(tmp)
+			fmt.Printf("wintun.dll 被占用（%v），下次退出后再更新。\n", err)
+			return
+		}
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		os.Remove(tmp)
+		fmt.Printf("wintun.dll 替换失败: %v\n", err)
+		return
+	}
+	fmt.Println("wintun.dll 已同步。")
+}
+
+// restartAfterUpdate 重启一个新进程，让新版立刻生效。
+// 只做「起一个新的」——旧进程继续跑到用户主动关掉，避免把用户正用着的代理掐断。
+func restartAfterUpdate(self string) {
+	args := os.Args[1:]
+	if len(args) == 0 {
+		fmt.Println("重启后请手动运行 icefall proxy 或 icefall tun。")
+		return
+	}
+	cmd := exec.Command(self, args...)
+	cmd.Dir = filepath.Dir(self)
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	if err := cmd.Start(); err != nil {
+		fmt.Printf("自动重启失败（%v），请手动启动 Icefall。\n", err)
+		return
+	}
+	fmt.Printf("已启动新版本（PID %d），旧进程可以关掉了。\n", cmd.Process.Pid)
 }
 
 // downloadFile 下载并写盘，同时打印进度百分比。
