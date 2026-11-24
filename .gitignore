@@ -1,0 +1,19 @@
+# 编译产物
+*.exe
+icefall
+icefall-darwin-amd64
+icefall-darwin-arm64
+
+# 分发打包
+dist/
+
+# 运行时生成
+strategy.json
+proxy-backup.*
+*.log
+dumps/
+*.bak
+
+# Python 缓存
+__pycache__/
+*.pyc
