@@ -117,7 +117,26 @@ icefall autostart [args...]       # 开机自启
 icefall noautostart               # 取消自启
 icefall probe <domain>            # 单域名三级判定：DNS / TCP / TLS
 icefall cut <domain>              # 扫单域名有效切点
+icefall version                   # 显示版本号
+icefall update [--check] [up]     # 从 GitHub 拉最新版替换自身
 ```
+
+## 升级
+
+装过一次之后就不必再下安装包：
+
+```bash
+icefall version            # 看当前版本
+icefall update --check     # 只查有没有新版
+icefall update             # 下载并替换自身
+```
+
+`update` 从 release 里取当前平台的裸二进制（`icefall.exe` / `icefall-darwin-arm64` / `icefall-darwin-amd64`），
+下载到同目录的 `.new`，然后把正在跑的 exe 改名成 `.old`、把 `.new` 改成正式名字。
+Windows 上正在运行的文件不能覆盖但能改名，所以这一步是安全的；当前进程继续用旧映像跑完，**下次启动就是新版**。
+
+参数里可以带一个兜底代理（`icefall update 127.0.0.1:7897`），
+`api.github.com` 直连不通的网络上用它走代理查 release。
 
 ## SOCKS5
 
